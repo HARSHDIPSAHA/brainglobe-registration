@@ -78,6 +78,7 @@ from brainglobe_registration.widgets.adjust_moving_image_view import (
 from brainglobe_registration.widgets.parameter_list_view import (
     RegistrationParameterListView,
 )
+from brainglobe_registration.widgets.qc_widget import QCWidget
 from brainglobe_registration.widgets.select_images_view import SelectImagesView
 from brainglobe_registration.widgets.target_selection_widget import (
     AutoSliceDialog,
@@ -85,7 +86,6 @@ from brainglobe_registration.widgets.target_selection_widget import (
 from brainglobe_registration.widgets.transform_select_view import (
     TransformSelectView,
 )
-from brainglobe_registration.widgets.qc_widget import QCWidget
 
 
 class RegistrationWidget(QScrollArea):
@@ -255,9 +255,7 @@ class RegistrationWidget(QScrollArea):
         self._widget.add_widget(
             self.qc_widget, widget_title="Quality Control (QC)"
         )
-        self.qc_widget.plot_qc_button.clicked.connect(
-            self._on_plot_qc_clicked
-        )
+        self.qc_widget.plot_qc_button.clicked.connect(self._on_plot_qc_clicked)
         self.qc_widget.clear_qc_button.clicked.connect(
             self._on_clear_qc_clicked
         )

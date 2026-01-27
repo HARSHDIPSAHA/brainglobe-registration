@@ -7,7 +7,6 @@ selects what to show, then triggers computation/display with one action.
 
 from qtpy.QtWidgets import (
     QCheckBox,
-    QHBoxLayout,
     QPushButton,
     QVBoxLayout,
     QWidget,
