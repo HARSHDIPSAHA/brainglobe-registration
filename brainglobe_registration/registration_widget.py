@@ -85,6 +85,7 @@ from brainglobe_registration.widgets.target_selection_widget import (
 from brainglobe_registration.widgets.transform_select_view import (
     TransformSelectView,
 )
+from brainglobe_registration.widgets.qc_widget import QCWidget
 
 
 class RegistrationWidget(QScrollArea):
@@ -100,9 +101,12 @@ class RegistrationWidget(QScrollArea):
         self._atlas_transform_matrix: Optional[npt.NDArray] = None
         self._moving_image: Optional[napari.layers.Image] = None
         self._moving_image_data_backup: Optional[npt.NDArray] = None
+        self._registered_image: Optional[napari.layers.Image] = None
         self.moving_anatomical_space: Optional[AnatomicalSpace] = None
         # Flag to differentiate between manual and automatic atlas deletion
         self._automatic_deletion_flag = False
+        # Saved display settings for red-green overlay restore
+        self._red_green_orig_display: Optional[dict] = None
 
         self.transform_params: dict[str, dict] = {
             "affine": {},
@@ -246,6 +250,18 @@ class RegistrationWidget(QScrollArea):
         )
         self._widget.add_widget(self.run_button, collapsible=False)
 
+        self.qc_widget = QCWidget()
+        self.qc_widget.set_enabled(False)
+        self._widget.add_widget(
+            self.qc_widget, widget_title="Quality Control (QC)"
+        )
+        self.qc_widget.plot_qc_button.clicked.connect(
+            self._on_plot_qc_clicked
+        )
+        self.qc_widget.clear_qc_button.clicked.connect(
+            self._on_clear_qc_clicked
+        )
+
         self._widget.layout().itemAt(1).widget().collapse(animate=False)
 
         check_atlas_installed(self)
@@ -274,6 +290,14 @@ class RegistrationWidget(QScrollArea):
             self._moving_image = None
             self._moving_image_data_backup = None
             self._update_dropdowns()
+
+        if self._registered_image == deleted_layer:
+            self._registered_image = None
+            self._red_green_orig_display = None
+            self.qc_widget.set_enabled(False)
+            self.qc_widget.red_green_checkbox.blockSignals(True)
+            self.qc_widget.red_green_checkbox.setChecked(False)
+            self.qc_widget.red_green_checkbox.blockSignals(False)
 
         # Check if deleted layer is the atlas reference / atlas annotations
         if (
@@ -506,7 +530,8 @@ class RegistrationWidget(QScrollArea):
             transform_image(atlas_image, parameters)
         )
 
-        self._viewer.add_image(
+        self._red_green_orig_display = None  # clear so restore does not reuse
+        self._registered_image = self._viewer.add_image(
             atlas_in_data_space, name="Registered Image", visible=False
         )
 
@@ -631,6 +656,8 @@ class RegistrationWidget(QScrollArea):
         self._atlas_data_layer.visible = False
         self._viewer.grid.enabled = False
 
+        self.qc_widget.set_enabled(True)
+
         print("Saving outputs")
         imwrite(self.output_directory / "downsampled.tiff", moving_image)
 
@@ -638,6 +665,109 @@ class RegistrationWidget(QScrollArea):
             self.output_directory / "brainglobe-registration.json", "w"
         ) as f:
             json.dump(self, f, default=serialize_registration_widget, indent=4)
+
+    def _on_plot_qc_clicked(self) -> None:
+        """Apply selected QC visualizations (Plot QC button)."""
+        if self.qc_widget.red_green_checkbox.isChecked():
+            self._apply_red_green_overlay()
+
+    def _on_clear_qc_clicked(self) -> None:
+        """Restore original layer display and clear QC state."""
+        self._restore_red_green_overlay()
+        self.qc_widget.red_green_checkbox.blockSignals(True)
+        self.qc_widget.red_green_checkbox.setChecked(False)
+        self.qc_widget.red_green_checkbox.blockSignals(False)
+
+    def _apply_red_green_overlay(self) -> None:
+        """
+        Apply red-green overlay using existing layers (no new image).
+        Atlas (Registered Image) = red, Moving = green, additive blending.
+        """
+        if self._registered_image is None or self._moving_image is None:
+            show_error(
+                "Registered Image or Moving image not found. "
+                "Please run registration first."
+            )
+            self.qc_widget.red_green_checkbox.setChecked(False)
+            return
+        if self._registered_image not in self._viewer.layers:
+            show_error(
+                "Registered Image layer was removed. "
+                "Please run registration again."
+            )
+            self.qc_widget.red_green_checkbox.setChecked(False)
+            return
+        if self._moving_image not in self._viewer.layers:
+            show_error(
+                "Moving image layer was removed. "
+                "Please run registration again."
+            )
+            self.qc_widget.red_green_checkbox.setChecked(False)
+            return
+
+        # Save original display settings for restore
+        def _saved(layer: napari.layers.Image) -> dict:
+            cm = layer.colormap
+            name = cm.name if hasattr(cm, "name") else str(cm)
+            return {
+                "colormap": name,
+                "blending": layer.blending,
+                "contrast_limits": tuple(layer.contrast_limits),
+                "visible": layer.visible,
+            }
+
+        self._red_green_orig_display = {
+            "registered": _saved(self._registered_image),
+            "moving": _saved(self._moving_image),
+        }
+
+        # Comparable contrast range from both layers (display only)
+        def _data_range(layer: napari.layers.Image) -> Tuple[float, float]:
+            r = getattr(layer, "contrast_limits_range", None)
+            if r is not None:
+                return (float(r[0]), float(r[1]))
+            data = get_data_from_napari_layer(layer)
+            return (float(np.min(data)), float(np.max(data)))
+
+        ra = _data_range(self._registered_image)
+        ma = _data_range(self._moving_image)
+        low = min(ra[0], ma[0])
+        high = max(ra[1], ma[1])
+
+        self._registered_image.colormap = "red"
+        self._registered_image.blending = "additive"
+        self._registered_image.contrast_limits = (low, high)
+        self._registered_image.visible = True
+
+        self._moving_image.colormap = "green"
+        self._moving_image.blending = "additive"
+        self._moving_image.contrast_limits = (low, high)
+        self._moving_image.visible = True
+
+    def _restore_red_green_overlay(self) -> None:
+        """Restore original colormap, blending, and contrast_limits."""
+        if self._red_green_orig_display is None:
+            return
+        orig = self._red_green_orig_display
+        if (
+            self._registered_image is not None
+            and self._registered_image in self._viewer.layers
+        ):
+            r = orig["registered"]
+            self._registered_image.colormap = r["colormap"]
+            self._registered_image.blending = r["blending"]
+            self._registered_image.contrast_limits = r["contrast_limits"]
+            self._registered_image.visible = r["visible"]
+        if (
+            self._moving_image is not None
+            and self._moving_image in self._viewer.layers
+        ):
+            m = orig["moving"]
+            self._moving_image.colormap = m["colormap"]
+            self._moving_image.blending = m["blending"]
+            self._moving_image.contrast_limits = m["contrast_limits"]
+            self._moving_image.visible = m["visible"]
+        self._red_green_orig_display = None
 
     def _on_transform_type_added(
         self, transform_type: str, transform_order: int
