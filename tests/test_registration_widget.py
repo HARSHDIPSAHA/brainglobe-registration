@@ -854,3 +854,121 @@ def test_set_optimal_rotation_params_sets_gui_values(
     adjust_widget_mock.adjust_atlas_roll.setValue.assert_called_once_with(-2)
     adjust_widget_mock.progress_bar.reset.assert_called_once()
     adjust_widget_mock.progress_bar.setVisible.assert_called_once_with(False)
+
+
+# ---- Jacobian QC tests ----
+
+
+def test_qc_widget_has_jacobian_checkbox(registration_widget):
+    """QC widget exposes Jacobian Determinant checkbox."""
+    assert hasattr(registration_widget.qc_widget, "jacobian_checkbox")
+    assert "Jacobian" in registration_widget.qc_widget.jacobian_checkbox.text()
+
+
+def test_qc_widget_has_save_jacobian_checkbox(registration_widget):
+    """QC widget exposes optional save Jacobian to output checkbox."""
+    assert hasattr(registration_widget.qc_widget, "save_jacobian_checkbox")
+    assert (
+        "Save" in registration_widget.qc_widget.save_jacobian_checkbox.text()
+    )
+    assert not registration_widget.qc_widget.save_jacobian_checkbox.isChecked()
+
+
+def test_set_enabled_disables_save_jacobian(registration_widget):
+    """When QC is disabled, save Jacobian checkbox is disabled."""
+    registration_widget.qc_widget.set_enabled(True)
+    assert registration_widget.qc_widget.save_jacobian_checkbox.isEnabled()
+    registration_widget.qc_widget.set_enabled(False)
+    assert not registration_widget.qc_widget.save_jacobian_checkbox.isEnabled()
+
+
+def test_set_jacobian_enabled_disables_checkbox(registration_widget):
+    """set_jacobian_enabled(False) disables Jacobian option."""
+    registration_widget.qc_widget.set_jacobian_enabled(True)
+    assert registration_widget.qc_widget.jacobian_checkbox.isEnabled()
+    registration_widget.qc_widget.set_jacobian_enabled(False)
+    assert not registration_widget.qc_widget.jacobian_checkbox.isEnabled()
+
+
+def test_show_jacobian_map_no_bspline_shows_error(registration_widget, mocker):
+    """_show_jacobian_map with no BSpline shows error and unchecks Jacobian."""
+    mocked_show_error = mocker.patch(
+        "brainglobe_registration.registration_widget.show_error"
+    )
+    registration_widget._has_bspline = False
+    registration_widget.qc_widget.jacobian_checkbox.setChecked(True)
+    registration_widget._show_jacobian_map()
+    mocked_show_error.assert_called_once()
+    assert "BSpline" in mocked_show_error.call_args[0][0]
+    assert not registration_widget.qc_widget.jacobian_checkbox.isChecked()
+
+
+def test_show_jacobian_map_no_registration_shows_error(
+    registration_widget, mocker
+):
+    """_show_jacobian_map with no registration result shows error."""
+    mocked_show_error = mocker.patch(
+        "brainglobe_registration.registration_widget.show_error"
+    )
+    registration_widget._has_bspline = True
+    registration_widget._last_registration_parameters = None
+    registration_widget._cached_moving_data = None
+    registration_widget.qc_widget.jacobian_checkbox.setChecked(True)
+    registration_widget._show_jacobian_map()
+    mocked_show_error.assert_called_once()
+    assert (
+        "Registration result not available"
+        in mocked_show_error.call_args[0][0]
+    )
+    assert not registration_widget.qc_widget.jacobian_checkbox.isChecked()
+
+
+def test_show_jacobian_map_with_bspline_adds_layer(
+    registration_widget, mocker
+):
+    """_show_jacobian_map with BSpline runs worker and adds Jacobian layer."""
+    registration_widget._has_bspline = True
+    registration_widget._last_registration_parameters = mocker.Mock()
+    registration_widget._cached_moving_data = np.zeros(
+        (10, 12), dtype=np.float32
+    )
+    registration_widget.qc_widget.jacobian_checkbox.setChecked(True)
+
+    fake_det_j = np.ones((10, 12), dtype=np.float32) * 0.99
+
+    mock_worker = mocker.Mock()
+    mocker.patch(
+        "brainglobe_registration.registration_widget.create_worker",
+        return_value=mock_worker,
+    )
+
+    registration_widget._show_jacobian_map()
+
+    # Worker was created and started
+    assert mock_worker.start.called
+
+    # Simulate worker finished successfully (connect(callback) was called)
+    cb = mock_worker.returned.connect.call_args[0][0]
+    cb(fake_det_j)
+
+    assert registration_widget._jacobian_layer is not None
+    np.testing.assert_array_almost_equal(
+        registration_widget._jacobian_layer.data, fake_det_j
+    )
+
+
+def test_clear_qc_removes_jacobian_layer(registration_widget, mocker):
+    """Clear QC removes Jacobian layer and unchecks checkbox."""
+    registration_widget._jacobian_layer = (
+        registration_widget._viewer.add_image(
+            np.ones((5, 5), dtype=np.float32), name="Jacobian Determinant"
+        )
+    )
+    registration_widget.qc_widget.jacobian_checkbox.setChecked(True)
+    registration_widget._on_clear_qc_clicked()
+    assert registration_widget._jacobian_layer is None
+    assert not registration_widget.qc_widget.jacobian_checkbox.isChecked()
+    assert not any(
+        "Jacobian" in layer.name
+        for layer in registration_widget._viewer.layers
+    )

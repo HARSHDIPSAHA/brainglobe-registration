@@ -11,7 +11,7 @@ Users can download and add the atlas images/structures as layers to the viewer.
 import json
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import dask.array as da
 import napari.layers
@@ -78,6 +78,7 @@ from brainglobe_registration.widgets.adjust_moving_image_view import (
 from brainglobe_registration.widgets.parameter_list_view import (
     RegistrationParameterListView,
 )
+from brainglobe_registration.widgets.qc_widget import QCWidget
 from brainglobe_registration.widgets.select_images_view import SelectImagesView
 from brainglobe_registration.widgets.target_selection_widget import (
     AutoSliceDialog,
@@ -100,6 +101,11 @@ class RegistrationWidget(QScrollArea):
         self._atlas_transform_matrix: Optional[npt.NDArray] = None
         self._moving_image: Optional[napari.layers.Image] = None
         self._moving_image_data_backup: Optional[npt.NDArray] = None
+        self._registered_image: Optional[napari.layers.Image] = None
+        self._jacobian_layer: Optional[napari.layers.Image] = None
+        self._cached_moving_data: Optional[npt.NDArray] = None
+        self._last_registration_parameters: Optional[Any] = None
+        self._has_bspline: bool = False
         self.moving_anatomical_space: Optional[AnatomicalSpace] = None
         # Flag to differentiate between manual and automatic atlas deletion
         self._automatic_deletion_flag = False
@@ -246,6 +252,16 @@ class RegistrationWidget(QScrollArea):
         )
         self._widget.add_widget(self.run_button, collapsible=False)
 
+        self.qc_widget = QCWidget()
+        self.qc_widget.set_enabled(False)
+        self._widget.add_widget(
+            self.qc_widget, widget_title="Quality Control (QC)"
+        )
+        self.qc_widget.plot_qc_button.clicked.connect(self._on_plot_qc_clicked)
+        self.qc_widget.clear_qc_button.clicked.connect(
+            self._on_clear_qc_clicked
+        )
+
         self._widget.layout().itemAt(1).widget().collapse(animate=False)
 
         check_atlas_installed(self)
@@ -274,6 +290,20 @@ class RegistrationWidget(QScrollArea):
             self._moving_image = None
             self._moving_image_data_backup = None
             self._update_dropdowns()
+
+        if self._registered_image == deleted_layer:
+            self._registered_image = None
+            self._cached_moving_data = None
+            self._last_registration_parameters = None
+            self._has_bspline = False
+            self.qc_widget.set_enabled(False)
+            self.qc_widget.jacobian_checkbox.blockSignals(True)
+            self.qc_widget.jacobian_checkbox.setChecked(False)
+            self.qc_widget.jacobian_checkbox.blockSignals(False)
+            if self._jacobian_layer is not None:
+                if self._jacobian_layer in self._viewer.layers:
+                    self._viewer.layers.remove(self._jacobian_layer)
+                self._jacobian_layer = None
 
         # Check if deleted layer is the atlas reference / atlas annotations
         if (
@@ -429,6 +459,7 @@ class RegistrationWidget(QScrollArea):
 
         from brainglobe_registration.elastix.register import (
             calculate_deformation_field,
+            compute_jacobian_determinant,
             invert_transformation,
             run_registration,
             transform_annotation_image,
@@ -506,7 +537,7 @@ class RegistrationWidget(QScrollArea):
             transform_image(atlas_image, parameters)
         )
 
-        self._viewer.add_image(
+        self._registered_image = self._viewer.add_image(
             atlas_in_data_space, name="Registered Image", visible=False
         )
 
@@ -631,6 +662,24 @@ class RegistrationWidget(QScrollArea):
         self._atlas_data_layer.visible = False
         self._viewer.grid.enabled = False
 
+        self._last_registration_parameters = parameters
+        self._cached_moving_data = moving_image
+        self._has_bspline = any(
+            t == "bspline" for t, _ in self.transform_selections
+        )
+        if (
+            self._has_bspline
+            and self.qc_widget.save_jacobian_checkbox.isChecked()
+        ):
+            det_j = compute_jacobian_determinant(deformation_field)
+            imwrite(
+                self.output_directory / "jacobian_determinant.tiff",
+                det_j,
+            )
+
+        self.qc_widget.set_enabled(True)
+        self.qc_widget.set_jacobian_enabled(self._has_bspline)
+
         print("Saving outputs")
         imwrite(self.output_directory / "downsampled.tiff", moving_image)
 
@@ -638,6 +687,110 @@ class RegistrationWidget(QScrollArea):
             self.output_directory / "brainglobe-registration.json", "w"
         ) as f:
             json.dump(self, f, default=serialize_registration_widget, indent=4)
+
+    def _on_plot_qc_clicked(self) -> None:
+        """Apply selected QC visualizations (Plot QC button)."""
+        if self.qc_widget.jacobian_checkbox.isChecked():
+            self._show_jacobian_map()
+
+    def _on_clear_qc_clicked(self) -> None:
+        """Remove QC layers and clear selection."""
+        self._remove_jacobian_map()
+        self.qc_widget.jacobian_checkbox.blockSignals(True)
+        self.qc_widget.jacobian_checkbox.setChecked(False)
+        self.qc_widget.jacobian_checkbox.blockSignals(False)
+
+    def _show_jacobian_map(self) -> None:
+        """Build Jacobian determinant map in a worker and show it."""
+        if not self._has_bspline:
+            show_error(
+                "Jacobian map is only for non-rigid (BSpline) transforms. "
+                "Run registration with BSpline enabled."
+            )
+            self.qc_widget.jacobian_checkbox.setChecked(False)
+            return
+        if (
+            self._last_registration_parameters is None
+            or self._cached_moving_data is None
+        ):
+            show_error(
+                "Registration result not available. Please run registration."
+            )
+            self.qc_widget.jacobian_checkbox.setChecked(False)
+            return
+
+        moving_data = self._cached_moving_data
+        params = self._last_registration_parameters
+
+        worker = create_worker(
+            self._generate_jacobian_thread,
+            moving_data,
+            params,
+        )
+        worker.returned.connect(self._update_jacobian_layer)
+        worker.errored.connect(self._on_jacobian_error)
+        worker.start()
+
+    def _generate_jacobian_thread(
+        self,
+        moving_data: npt.NDArray,
+        params: Any,
+    ) -> npt.NDArray:
+        """Compute Jacobian determinant in background (elastix + numpy)."""
+        from brainglobe_registration.elastix.register import (
+            calculate_deformation_field,
+            compute_jacobian_determinant,
+        )
+
+        def_field = calculate_deformation_field(moving_data, params)
+        det_j = compute_jacobian_determinant(def_field)
+        return det_j
+
+    def _update_jacobian_layer(self, det_j: npt.NDArray) -> None:
+        """Add or update Jacobian layer on main thread."""
+        try:
+            # Optional: log min/max/mean and % folding
+            n_fold = int(np.sum(det_j <= 0))
+            n_total = det_j.size
+            pct_fold = 100.0 * n_fold / n_total if n_total else 0.0
+            logging.info(
+                "Jacobian: min=%.4f max=%.4f mean=%.4f |J|<=0: %d (%.2f%%)",
+                float(np.min(det_j)),
+                float(np.max(det_j)),
+                float(np.mean(det_j)),
+                n_fold,
+                pct_fold,
+            )
+            if self._jacobian_layer is not None:
+                if self._jacobian_layer in self._viewer.layers:
+                    self._jacobian_layer.data = det_j
+                    self._jacobian_layer.visible = True
+                else:
+                    self._jacobian_layer = None
+            if self._jacobian_layer is None:
+                self._jacobian_layer = self._viewer.add_image(
+                    det_j,
+                    name="Jacobian Determinant",
+                    colormap="coolwarm",
+                    blending="translucent",
+                    opacity=0.7,
+                    contrast_limits=(0.0, 2.0),
+                )
+        except Exception as e:
+            show_error(f"Error updating Jacobian layer: {e}")
+            self.qc_widget.jacobian_checkbox.setChecked(False)
+
+    def _on_jacobian_error(self, exc: Exception) -> None:
+        """Handle Jacobian worker errors."""
+        show_error(f"Jacobian map failed: {exc}")
+        self.qc_widget.jacobian_checkbox.setChecked(False)
+
+    def _remove_jacobian_map(self) -> None:
+        """Remove the Jacobian determinant layer."""
+        if self._jacobian_layer is not None:
+            if self._jacobian_layer in self._viewer.layers:
+                self._viewer.layers.remove(self._jacobian_layer)
+            self._jacobian_layer = None
 
     def _on_transform_type_added(
         self, transform_type: str, transform_order: int

@@ -8,6 +8,7 @@ from tifffile import imread
 
 from brainglobe_registration.elastix.register import (
     calculate_deformation_field,
+    compute_jacobian_determinant,
     invert_transformation,
     run_registration,
     setup_parameter_object,
@@ -196,6 +197,40 @@ def test_calculate_deformation_field(
     )
 
     assert np.allclose(deformation_field, expected_deformation_field, atol=0.5)
+
+
+def test_compute_jacobian_determinant_identity_2d():
+    """Zero displacement field gives det(J) ≈ 1 everywhere."""
+    h, w = 8, 10
+    disp = np.zeros((h, w, 2), dtype=np.float32)
+    det_j = compute_jacobian_determinant(disp)
+    assert det_j.shape == (h, w)
+    assert det_j.dtype == np.float32
+    np.testing.assert_allclose(det_j, 1.0, atol=1e-5)
+
+
+def test_compute_jacobian_determinant_identity_3d():
+    """Zero displacement field in 3D gives det(J) ≈ 1 everywhere."""
+    d, h, w = 4, 6, 8
+    disp = np.zeros((d, h, w, 3), dtype=np.float32)
+    det_j = compute_jacobian_determinant(disp)
+    assert det_j.shape == (d, h, w)
+    assert det_j.dtype == np.float32
+    np.testing.assert_allclose(det_j, 1.0, atol=1e-5)
+
+
+def test_compute_jacobian_determinant_wrong_ndim_raises():
+    """Last dimension must be 2 or 3."""
+    bad = np.zeros((5, 5, 4), dtype=np.float32)  # 4 components
+    with pytest.raises(ValueError, match="last dim 2 or 3, got 4"):
+        compute_jacobian_determinant(bad)
+
+
+def test_compute_jacobian_determinant_wrong_ndim_one_raises():
+    """Last dimension 1 is invalid."""
+    bad = np.zeros((5, 5, 1), dtype=np.float32)
+    with pytest.raises(ValueError, match="last dim 2 or 3, got 1"):
+        compute_jacobian_determinant(bad)
 
 
 def test_setup_parameter_object_empty_list():
