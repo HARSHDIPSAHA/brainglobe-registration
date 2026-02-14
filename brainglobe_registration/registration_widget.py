@@ -74,6 +74,7 @@ from brainglobe_registration.utils.transforms import (
     rotate_volume,
 )
 from brainglobe_registration.utils.visuals import generate_checkerboard
+from brainglobe_registration.utils.visualise import visualise_cutting_plane
 from brainglobe_registration.widgets.adjust_moving_image_view import (
     AdjustMovingImageView,
 )
@@ -238,6 +239,13 @@ class RegistrationWidget(QScrollArea):
         self.run_button.clicked.connect(self._on_run_button_click)
         self.run_button.setEnabled(False)
 
+        self.visualise_button = QPushButton("Visualize Last Registration")
+        self.visualise_button.setToolTip(
+            "Show the 3D plane used for the last registration"
+        )
+        self.visualise_button.setEnabled(False)
+        self.visualise_button.clicked.connect(self._on_visualise_clicked)
+
         self._widget.add_widget(
             header_widget(
                 "brainglobe-<br>registration",  # line break at <br>
@@ -282,6 +290,7 @@ class RegistrationWidget(QScrollArea):
             self.output_directory_widget, collapsible=False
         )
         self._widget.add_widget(self.run_button, collapsible=False)
+        self._widget.add_widget(self.visualise_button, collapsible=False)
 
         self._widget.layout().itemAt(1).widget().collapse(animate=False)
 
@@ -745,6 +754,8 @@ class RegistrationWidget(QScrollArea):
         ) as f:
             json.dump(self, f, default=serialize_registration_widget, indent=4)
 
+        self.visualise_button.setEnabled(True)
+
     def _on_plot_qc_clicked(self):
         """
         Generate all selected QC visualizations.
@@ -977,6 +988,14 @@ class RegistrationWidget(QScrollArea):
 
         # Uncheck all QC checkboxes
         self.qc_widget.checkerboard_checkbox.setChecked(False)
+
+    def _on_visualise_clicked(self) -> None:
+        if not self.output_directory:
+            show_error("No output directory selected.")
+            return
+
+        json_path = self.output_directory / "brainglobe-registration.json"
+        visualise_cutting_plane(self._viewer, json_path)
 
     def _on_transform_type_added(
         self, transform_type: str, transform_order: int
