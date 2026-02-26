@@ -10,6 +10,7 @@ Users can download and add the atlas images/structures as layers to the viewer.
 
 import json
 import logging
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -41,6 +42,7 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QTabWidget,
@@ -238,6 +240,21 @@ class RegistrationWidget(QScrollArea):
         self.run_button.clicked.connect(self._on_run_button_click)
         self.run_button.setEnabled(False)
 
+        self.cancel_registration_button = QPushButton("Cancel registration")
+        self.cancel_registration_button.clicked.connect(
+            self._on_cancel_registration_clicked
+        )
+        self.cancel_registration_button.setEnabled(False)
+
+        self.registration_status_label = QLabel("Idle")
+        self.registration_progress_bar = QProgressBar()
+        self.registration_progress_bar.setRange(0, 100)
+        self.registration_progress_bar.setValue(0)
+        self.registration_progress_bar.setVisible(False)
+
+        self._registration_worker = None
+        self._registration_cancel_requested = False
+
         self._widget.add_widget(
             header_widget(
                 "brainglobe-<br>registration",  # line break at <br>
@@ -283,6 +300,13 @@ class RegistrationWidget(QScrollArea):
             self.output_directory_widget, collapsible=False
         )
         self._widget.add_widget(self.run_button, collapsible=False)
+        self._widget.add_widget(
+            self.cancel_registration_button, collapsible=False
+        )
+        self._widget.add_widget(self.registration_status_label, collapsible=False)
+        self._widget.add_widget(
+            self.registration_progress_bar, collapsible=False
+        )
 
         self._widget.layout().itemAt(1).widget().collapse(animate=False)
 
@@ -473,6 +497,46 @@ class RegistrationWidget(QScrollArea):
             )
             return
 
+        if len(self.transform_selections) == 0:
+            display_info(
+                widget=self,
+                title="No Transforms Selected",
+                message="Please select at least one transform "
+                "before clicking 'Run'.",
+            )
+
+            return
+
+        payload = self._prepare_registration_payload()
+
+        self._registration_cancel_requested = False
+        self._set_registration_busy_state(True)
+        self._update_registration_progress(
+            progress=0, status="Preparing files..."
+        )
+
+        self._registration_worker = create_worker(
+            self._run_registration_worker,
+            payload,
+        )
+        self._registration_worker.yielded.connect(
+            self._on_registration_progress_update
+        )
+        self._registration_worker.returned.connect(
+            self._on_registration_worker_finished
+        )
+        self._registration_worker.errored.connect(
+            self._on_registration_worker_errored
+        )
+        self._registration_worker.start()
+
+    def _prepare_registration_payload(self) -> dict:
+        assert self._atlas
+        assert self._atlas_data_layer
+        assert self._atlas_annotations_layer
+        assert self._moving_image
+        assert self.output_directory
+
         moving_image = get_data_from_napari_layer(self._moving_image).astype(
             np.uint16
         )
@@ -565,7 +629,60 @@ class RegistrationWidget(QScrollArea):
                     str(self._moving_image.data.ndim)
                 ]
 
-        # Import elastix functions locally to avoid slow widget loading
+        return {
+            "atlas": self._atlas,
+            "atlas_image": atlas_image,
+            "annotation_image": annotation_image,
+            "moving_image": moving_image,
+            "moving_image_name": self._moving_image.name,
+            "moving_image_ndim": self._moving_image.data.ndim,
+            "transform_selections": deepcopy(self.transform_selections),
+            "output_directory": self.output_directory,
+            "filter_images": self.filter_checkbox.isChecked(),
+            "atlas_transform_matrix": self._atlas_transform_matrix.copy(),
+            "atlas_offset": self._atlas_offset.copy(),
+            "atlas_data_shape": self._atlas_data_layer.data.shape,
+            "atlas_hemispheres": self._atlas.hemispheres,
+            "atlas_2d_slice_index": self._atlas_2d_slice_index,
+        }
+
+    def _set_registration_busy_state(self, is_busy: bool):
+        self.run_button.setEnabled(not is_busy)
+        self.cancel_registration_button.setEnabled(is_busy)
+        self.filter_checkbox.setEnabled(not is_busy)
+        self.output_directory_text_field.setEnabled(not is_busy)
+        self.open_file_dialog.setEnabled(not is_busy)
+
+        self.run_button.setText("Running..." if is_busy else "Run")
+
+        if is_busy:
+            self.registration_progress_bar.setVisible(True)
+        elif self.registration_status_label.text() == "Idle":
+            self.registration_progress_bar.setVisible(False)
+
+    def _update_registration_progress(self, progress: int, status: str):
+        self.registration_progress_bar.setValue(progress)
+        self.registration_status_label.setText(status)
+
+    def _on_registration_progress_update(self, update: dict):
+        if not isinstance(update, dict):
+            return
+
+        progress = update.get("progress")
+        status = update.get("status")
+        if progress is not None and status is not None:
+            self._update_registration_progress(progress=progress, status=status)
+
+    def _on_cancel_registration_clicked(self):
+        if self._registration_worker is None:
+            return
+
+        self._registration_cancel_requested = True
+        self.cancel_registration_button.setEnabled(False)
+        self.registration_status_label.setText("Cancelling registration...")
+        self._registration_worker.quit()
+
+    def _run_registration_worker(self, payload: dict):
         from brainglobe_registration.elastix.register import (
             calculate_deformation_field,
             invert_transformation,
@@ -574,86 +691,81 @@ class RegistrationWidget(QScrollArea):
             transform_image,
         )
 
-        if len(self.transform_selections) == 0:
-            display_info(
-                widget=self,
-                title="No Transforms Selected",
-                message="Please select at least one transform "
-                "before clicking 'Run'.",
-            )
+        if self._registration_cancel_requested:
+            return {"cancelled": True}
 
-            return
+        output_directory = payload["output_directory"]
+        moving_image = payload["moving_image"]
+        atlas_image = payload["atlas_image"]
+        annotation_image = payload["annotation_image"]
+        moving_image_ndim = payload["moving_image_ndim"]
 
-        print("Running registration")
+        yield {"progress": 10, "status": "Running Elastix (stage 1/3)..."}
         parameters = run_registration(
             atlas_image,
             moving_image,
-            self.transform_selections,
-            self.output_directory,
-            filter_images=self.filter_checkbox.isChecked(),
+            payload["transform_selections"],
+            output_directory,
+            filter_images=payload["filter_images"],
         )
 
-        atlas_in_data_space = da.from_array(
-            transform_image(atlas_image, parameters)
-        )
+        if self._registration_cancel_requested:
+            return {"cancelled": True}
 
-        # Save reference to registered image layer for QC visualizations
-        self._registered_image = self._viewer.add_image(
-            atlas_in_data_space, name="Registered Image", visible=False
-        )
+        yield {"progress": 35, "status": "Applying transform..."}
+        atlas_in_data_space = da.from_array(transform_image(atlas_image, parameters))
 
-        print("Inverting transformation")
+        yield {
+            "progress": 50,
+            "status": "Running inverse transform (stage 2/3)...",
+        }
         inverse_parameters = invert_transformation(
             atlas_image,
-            self.transform_selections,
+            payload["transform_selections"],
             parameters,
-            self.output_directory,
-            filter_images=self.filter_checkbox.isChecked(),
+            output_directory,
+            filter_images=payload["filter_images"],
         )
 
         data_in_atlas_space = da.from_array(
             transform_image(moving_image, inverse_parameters)
         )
         data_in_atlas_space_path = (
-            self.output_directory
-            / f"downsampled_standard_{self._moving_image.name}.tiff"
+            output_directory / f"downsampled_standard_{payload['moving_image_name']}.tiff"
         )
+        imwrite(data_in_atlas_space_path, data_in_atlas_space)
 
-        imwrite(
-            data_in_atlas_space_path,
-            data_in_atlas_space,
-        )
+        if self._registration_cancel_requested:
+            return {"cancelled": True}
 
-        self._viewer.add_image(
-            data_in_atlas_space,
-            name="Inverse Registered Image",
-            visible=False,
-        )
-
-        print("Transforming annotation image")
+        yield {
+            "progress": 70,
+            "status": "Transforming annotations (stage 3/3)...",
+        }
         registered_annotation_image = transform_annotation_image(
             annotation_image,
             parameters,
         )
 
-        registered_annotation_image_path = (
-            self.output_directory / "registered_atlas.tiff"
-        )
+        registered_annotation_image_path = output_directory / "registered_atlas.tiff"
         imwrite(registered_annotation_image_path, registered_annotation_image)
-        hemispheres_image = self._atlas.hemispheres
 
-        if not np.allclose(self._atlas_transform_matrix, np.eye(3)):
+        hemispheres_image = payload["atlas_hemispheres"]
+
+        if not np.allclose(payload["atlas_transform_matrix"], np.eye(3)):
             hemispheres_image = dask_affine_transform(
-                self._atlas.hemispheres,
-                self._atlas_transform_matrix,
-                offset=self._atlas_offset,
+                payload["atlas_hemispheres"],
+                payload["atlas_transform_matrix"],
+                offset=payload["atlas_offset"],
                 order=0,
-                output_shape=self._atlas_data_layer.data.shape,
+                output_shape=payload["atlas_data_shape"],
             )
 
-        if self._moving_image.ndim == 2:
+        if moving_image_ndim == 2:
             hemispheres_image = hemispheres_image[
-                self._atlas_2d_slice_index, :, :
+                payload["atlas_2d_slice_index"],
+                :,
+                :,
             ]
 
         if isinstance(hemispheres_image, da.Array):
@@ -663,98 +775,139 @@ class RegistrationWidget(QScrollArea):
             hemispheres_image, parameters
         )
 
-        registered_hemispheres_path = (
-            self.output_directory / "registered_hemispheres.tiff"
-        )
+        registered_hemispheres_path = output_directory / "registered_hemispheres.tiff"
         imwrite(registered_hemispheres_path, registered_hemispheres)
 
-        if self._moving_image.data.ndim == 2:
-            region_stat_path = self.output_directory / "areas.csv"
+        if moving_image_ndim == 2:
+            region_stat_path = output_directory / "areas.csv"
         else:
-            region_stat_path = self.output_directory / "volumes.csv"
+            region_stat_path = output_directory / "volumes.csv"
 
         calculate_region_size(
-            self._atlas,
+            payload["atlas"],
             registered_annotation_image,
             registered_hemispheres,
             region_stat_path,
         )
 
-        # Free up memory
-        del registered_hemispheres
-        del hemispheres_image
-
         boundaries = find_boundaries(
             registered_annotation_image, mode="inner"
         ).astype(np.int8, copy=False)
 
-        imwrite(self.output_directory / "boundaries.tiff", boundaries)
+        imwrite(output_directory / "boundaries.tiff", boundaries)
 
-        if self._moving_image.data.ndim != 2:
-            # Free up memory
-            del registered_annotation_image
-
-            registered_annotation_image = dask_imread(
-                registered_annotation_image_path
-            )
-
-        self._viewer.add_labels(
-            registered_annotation_image,
-            name="Registered Annotations",
-            visible=False,
-        )
-
-        self._viewer.add_image(
-            boundaries,
-            name="Registered Boundaries",
-            visible=True,
-            blending="additive",
-            opacity=0.8,
-        )
-
-        print("Calculating deformation field")
-        deformation_field = calculate_deformation_field(
-            moving_image, parameters
-        )
+        yield {"progress": 90, "status": "Calculating deformation field..."}
+        deformation_field = calculate_deformation_field(moving_image, parameters)
 
         for i in range(deformation_field.shape[-1]):
             imwrite(
-                self.output_directory / f"deformation_field_{i}.tiff",
+                output_directory / f"deformation_field_{i}.tiff",
                 deformation_field[..., i],
             )
 
-        self._atlas_data_layer.visible = False
-        self._viewer.grid.enabled = False
+        imwrite(output_directory / "downsampled.tiff", moving_image)
 
-        # Cache image data for QC (avoids repeated layer queries)
-        # Improves performance: get_data_from_napari_layer can be slow
-        # with Dask arrays or large images
-        self._cached_moving_data = get_data_from_napari_layer(
-            self._moving_image
+        return {
+            "cancelled": False,
+            "atlas_in_data_space": atlas_in_data_space,
+            "data_in_atlas_space": data_in_atlas_space,
+            "registered_annotation_image": registered_annotation_image,
+            "registered_annotation_image_path": registered_annotation_image_path,
+            "boundaries": boundaries,
+            "moving_image": moving_image,
+        }
+
+    def _on_registration_worker_finished(self, result: dict):
+        try:
+            if result.get("cancelled"):
+                self._update_registration_progress(
+                    progress=0, status="Registration cancelled."
+                )
+                return
+
+            assert self._atlas_data_layer
+            assert self._moving_image
+            assert self.output_directory
+
+            self._registered_image = self._viewer.add_image(
+                result["atlas_in_data_space"],
+                name="Registered Image",
+                visible=False,
+            )
+
+            self._viewer.add_image(
+                result["data_in_atlas_space"],
+                name="Inverse Registered Image",
+                visible=False,
+            )
+
+            registered_annotation_image = result["registered_annotation_image"]
+            if self._moving_image.data.ndim != 2:
+                registered_annotation_image = dask_imread(
+                    result["registered_annotation_image_path"]
+                )
+
+            self._viewer.add_labels(
+                registered_annotation_image,
+                name="Registered Annotations",
+                visible=False,
+            )
+
+            self._viewer.add_image(
+                result["boundaries"],
+                name="Registered Boundaries",
+                visible=True,
+                blending="additive",
+                opacity=0.8,
+            )
+
+            self._atlas_data_layer.visible = False
+            self._viewer.grid.enabled = False
+
+            self._cached_moving_data = get_data_from_napari_layer(
+                self._moving_image
+            )
+            self._cached_registered_data = get_data_from_napari_layer(
+                self._registered_image
+            )
+
+            self.qc_widget.set_enabled(True)
+
+            min_dimension = min(result["moving_image"].shape[-2:])
+            default_square_size = max(8, min_dimension // 16)
+            if self.qc_widget.square_size_spinbox.value() == 32:
+                self.qc_widget.square_size_spinbox.setValue(default_square_size)
+
+            with open(
+                self.output_directory / "brainglobe-registration.json", "w"
+            ) as f:
+                json.dump(
+                    self,
+                    f,
+                    default=serialize_registration_widget,
+                    indent=4,
+                )
+
+            self._update_registration_progress(
+                progress=100,
+                status="Registration complete.",
+            )
+        finally:
+            self._registration_worker = None
+            self._registration_cancel_requested = False
+            self._set_registration_busy_state(False)
+
+    def _on_registration_worker_errored(self, exception: Exception):
+        output_dir = str(self.output_directory) if self.output_directory else "N/A"
+        logging.exception("Registration failed", exc_info=exception)
+        show_error(
+            "Registration failed. See console/logs for details. "
+            f"Output directory: {output_dir}"
         )
-        self._cached_registered_data = get_data_from_napari_layer(
-            self._registered_image
-        )
-
-        # Enable QC widget now that registration is complete
-        self.qc_widget.set_enabled(True)
-
-        # Set default square size based on image dimensions if not
-        # user-modified (adaptive: roughly 1/16th of smallest dimension,
-        # minimum 8 pixels)
-        min_dimension = min(moving_image.shape[-2:])
-        default_square_size = max(8, min_dimension // 16)
-        # Only update if still at default value (32)
-        if self.qc_widget.square_size_spinbox.value() == 32:
-            self.qc_widget.square_size_spinbox.setValue(default_square_size)
-
-        print("Saving outputs")
-        imwrite(self.output_directory / "downsampled.tiff", moving_image)
-
-        with open(
-            self.output_directory / "brainglobe-registration.json", "w"
-        ) as f:
-            json.dump(self, f, default=serialize_registration_widget, indent=4)
+        self._update_registration_progress(progress=0, status="Registration failed.")
+        self._registration_worker = None
+        self._registration_cancel_requested = False
+        self._set_registration_busy_state(False)
 
     def _on_plot_qc_clicked(self):
         """

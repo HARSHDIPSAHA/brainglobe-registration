@@ -1,4 +1,5 @@
 import logging
+import types
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,47 @@ from brainglobe_registration.utils.logging import (
 from brainglobe_registration.widgets.adjust_moving_image_view import (
     AdjustMovingImageView,
 )
+
+
+class _DummySignal:
+    def __init__(self):
+        self._callbacks = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def emit(self, value):
+        for callback in self._callbacks:
+            callback(value)
+
+
+class _ImmediateWorker:
+    def __init__(self, fn, *args, **kwargs):
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self.yielded = _DummySignal()
+        self.returned = _DummySignal()
+        self.errored = _DummySignal()
+
+    def start(self):
+        try:
+            output = self._fn(*self._args, **self._kwargs)
+            if isinstance(output, types.GeneratorType):
+                while True:
+                    try:
+                        update = next(output)
+                        self.yielded.emit(update)
+                    except StopIteration as stop:
+                        self.returned.emit(stop.value)
+                        break
+            else:
+                self.returned.emit(output)
+        except Exception as exception:
+            self.errored.emit(exception)
+
+    def quit(self):
+        return None
 
 
 @pytest.fixture()
@@ -569,13 +611,24 @@ def test_on_run_button_clicked_moving_equal_atlas(
     )
 
 
-def test_on_run_button_click_2d(registration_widget, tmp_path):
-    allen_25_index = registration_widget._available_atlases.index(
-        "allen_mouse_25um"
-    )
-    registration_widget._on_atlas_dropdown_index_changed(allen_25_index)
+def test_on_run_button_click_2d(registration_widget, tmp_path, mocker):
+    def _make_immediate_worker(fn, *args, **kwargs):
+        return _ImmediateWorker(fn, *args, **kwargs)
 
-    registration_widget._viewer.dims.set_current_step(0, 293)
+    mocker.patch(
+        "brainglobe_registration.registration_widget.create_worker",
+        side_effect=_make_immediate_worker,
+    )
+
+    atlas_index = next(
+        i
+        for i, atlas_name in enumerate(registration_widget._available_atlases)
+        if atlas_name != "------"
+    )
+    registration_widget._on_atlas_dropdown_index_changed(atlas_index)
+
+    mid_slice = registration_widget._atlas.reference.shape[0] // 2
+    registration_widget._viewer.dims.set_current_step(0, mid_slice)
     moving_image = imread(
         Path(__file__).parent / "test_images/sample_hipp.tif"
     ).astype(np.float32)
@@ -605,6 +658,54 @@ def test_on_run_button_click_2d(registration_widget, tmp_path):
 
     # Check that QC widget is enabled after registration
     assert registration_widget.qc_widget.checkerboard_checkbox.isEnabled()
+
+
+def test_run_button_click_sets_busy_state(
+    registration_widget_with_example_atlas, mocker, tmp_path
+):
+    mocked_worker = mocker.Mock()
+    mocked_worker.yielded = mocker.Mock()
+    mocked_worker.yielded.connect = mocker.Mock()
+    mocked_worker.returned = mocker.Mock()
+    mocked_worker.returned.connect = mocker.Mock()
+    mocked_worker.errored = mocker.Mock()
+    mocked_worker.errored.connect = mocker.Mock()
+    mocked_worker.start = mocker.Mock()
+
+    mocked_create_worker = mocker.patch(
+        "brainglobe_registration.registration_widget.create_worker",
+        return_value=mocked_worker,
+    )
+
+    widget = registration_widget_with_example_atlas
+    widget.output_directory = tmp_path
+    widget.run_button.setEnabled(True)
+
+    widget.run_button.click()
+
+    mocked_create_worker.assert_called_once()
+    assert not widget.run_button.isEnabled()
+    assert widget.cancel_registration_button.isEnabled()
+    assert widget.run_button.text() == "Running..."
+    assert not widget.registration_progress_bar.isHidden()
+    assert widget.registration_status_label.text() == "Preparing files..."
+
+
+def test_cancel_registration_requests_worker_stop(registration_widget, mocker):
+    mocked_worker = mocker.Mock()
+    mocked_worker.quit = mocker.Mock()
+    registration_widget._registration_worker = mocked_worker
+    registration_widget.cancel_registration_button.setEnabled(True)
+
+    registration_widget._on_cancel_registration_clicked()
+
+    assert registration_widget._registration_cancel_requested
+    mocked_worker.quit.assert_called_once()
+    assert not registration_widget.cancel_registration_button.isEnabled()
+    assert (
+        registration_widget.registration_status_label.text()
+        == "Cancelling registration..."
+    )
 
 
 def test_on_run_button_clicked_no_transform_selected(
