@@ -39,7 +39,12 @@ dependencies = [
     "qt-niu",
     "scikit-image",
     "scipy",
-    "tifffile"
+    "tifffile",
+    # PyNutil integration for quantification
+    "pynutil>=0.5.4",
+    "orjson",
+    "pynrrd",
+    "nibabel",
 ]
 
 [project.urls]

@@ -81,6 +81,7 @@ from brainglobe_registration.widgets.parameter_list_view import (
     RegistrationParameterListView,
 )
 from brainglobe_registration.widgets.qc_widget import QCWidget
+from brainglobe_registration.widgets.pynutil_widget import PyNutilWidget
 from brainglobe_registration.widgets.select_images_view import SelectImagesView
 from brainglobe_registration.widgets.target_selection_widget import (
     AutoSliceDialog,
@@ -106,6 +107,11 @@ class RegistrationWidget(QScrollArea):
         self._atlas_2d_slice_corners: npt.NDArray = np.zeros((4, 3))
         self._moving_image: Optional[napari.layers.Image] = None
         self._moving_image_data_backup: Optional[npt.NDArray] = None
+
+        # PyNutil integration: store plane anchoring for export
+        self._plane_anchoring: Optional[np.ndarray] = None
+        self._atlas_name: str = "allen_mouse_25um"
+        self._damage_mask: Optional[np.ndarray] = None
 
         self.moving_anatomical_space: Optional[AnatomicalSpace] = None
         # Flag to differentiate between manual and automatic atlas deletion
@@ -276,6 +282,12 @@ class RegistrationWidget(QScrollArea):
         # Add QC widget after Advanced Settings
         self._widget.add_widget(self.qc_widget, widget_title="Quality Control")
 
+        # Add PyNutil integration widget
+        self._pynutil_widget = PyNutilWidget(self._viewer, self)
+        self._widget.add_widget(
+            self._pynutil_widget, widget_title="PyNutil Quantification"
+        )
+
         self._widget.add_widget(self.filter_checkbox, collapsible=False)
 
         self._widget.add_widget(QLabel("Output Directory"), collapsible=False)
@@ -372,6 +384,7 @@ class RegistrationWidget(QScrollArea):
         self.run_button.setEnabled(True)
 
         self._atlas = BrainGlobeAtlas(atlas_name)
+        self._atlas_name = atlas_name  # Store for PyNutil integration
         dask_reference = da.from_array(
             self._atlas.reference,
             chunks=(
@@ -735,6 +748,11 @@ class RegistrationWidget(QScrollArea):
         self._cached_registered_data = get_data_from_napari_layer(
             self._registered_image
         )
+
+        # Compute and store plane anchoring for PyNutil integration
+        # Anchoring vector: [ox, oy, oz, ux, uy, uz, vx, vy, vz]
+        # where o is origin, u and v are axis vectors in physical coordinates
+        self._compute_plane_anchoring()
 
         # Enable QC widget now that registration is complete
         self.qc_widget.set_enabled(True)
@@ -1459,3 +1477,72 @@ class RegistrationWidget(QScrollArea):
             "filter": self.filter_checkbox.isChecked(),
             "output_directory": self.output_directory,
         }
+
+    def _compute_plane_anchoring(self):
+        """
+        Compute the plane anchoring vector for PyNutil integration.
+
+        The anchoring vector is a 9-element array [ox, oy, oz, ux, uy, uz, vx, vy, vz]
+        where:
+        - o is the origin (physical coordinates of pixel [0, 0])
+        - u is the axis vector for the x-direction (physical units per pixel)
+        - v is the axis vector for the y-direction (physical units per pixel)
+
+        This is computed from the atlas transform matrix and offset.
+        """
+        if self._atlas is None:
+            return
+
+        # Get the current slice index
+        slice_idx = self._atlas_2d_slice_index
+        if slice_idx < 0:
+            slice_idx = self._viewer.dims.current_step[0]
+
+        # Atlas resolution (physical size per voxel)
+        resolution = self._atlas.resolution  # (z_res, y_res, x_res)
+
+        # Get the rotation matrix and offset
+        rot_matrix = self._atlas_transform_matrix  # 3x3 matrix
+        offset = self._atlas_offset  # 3-element vector
+
+        # The plane is at slice_idx in the rotated atlas space
+        # We need to map this back to physical coordinates
+
+        # Center of rotated volume
+        rotated_shape = self._atlas_data_layer.data.shape
+        rotated_center = np.array(rotated_shape) / 2.0
+
+        # Center of original atlas
+        original_shape = np.array(self._atlas.shape)
+        original_center = original_shape / 2.0
+
+        # Origin: pixel [0, 0] in the 2D plane at slice_idx
+        # In rotated space: (slice_idx, 0, 0)
+        point_in_rotated = np.array([slice_idx, 0, 0])
+
+        # Map to original space: original = rot_matrix @ (rotated - rotated_center) + original_center
+        point_in_original = rot_matrix @ (point_in_rotated - rotated_center) + original_center
+
+        # Add offset
+        point_in_original += offset
+
+        # Convert to physical coordinates (multiply by resolution)
+        origin_physical = point_in_original * resolution
+
+        # U vector: direction of x-axis in physical coordinates
+        # One pixel in x direction in rotated space
+        u_point_rotated = np.array([slice_idx, 0, 1])
+        u_point_original = rot_matrix @ (u_point_rotated - rotated_center) + original_center + offset
+        u_physical = (u_point_original - point_in_original) * resolution
+
+        # V vector: direction of y-axis in physical coordinates
+        v_point_rotated = np.array([slice_idx, 1, 0])
+        v_point_original = rot_matrix @ (v_point_rotated - rotated_center) + original_center + offset
+        v_physical = (v_point_original - point_in_original) * resolution
+
+        # Build anchoring vector
+        self._plane_anchoring = np.array([
+            origin_physical[0], origin_physical[1], origin_physical[2],  # ox, oy, oz
+            u_physical[0], u_physical[1], u_physical[2],  # ux, uy, uz
+            v_physical[0], v_physical[1], v_physical[2],  # vx, vy, vz
+        ], dtype=np.float64)
